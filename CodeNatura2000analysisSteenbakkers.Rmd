@@ -1,0 +1,807 @@
+---
+title: "alle code"
+output:
+  word_document: default
+  html_document: default
+date: "2025-08-05"
+---
+#Code 1 - Species deduplication
+```{r}
+library(dplyr)
+library(purrr)
+library(rgbif)
+
+species <- read.csv("Natura2000_end2023_SPECIES.csv")#All natura 2000 animals
+
+# Safe null-handling operator
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Function to safely resolve synonyms and return accepted names
+check_species <- function(name) {
+  result <- tryCatch(name_backbone(name = name), error = function(e) NULL)
+  
+  if (is.null(result)) {
+    return(tibble(SPECIESNAME = name, 
+                  accepted_name = NA_character_, 
+                  match_status = NA_character_))
+  }
+  
+  match_status <- result$status %||% NA_character_
+  
+  # If it's a synonym, use the acceptedUsageKey to get the accepted name
+  if (!is.na(match_status) && match_status == "SYNONYM") {
+    accepted_name <- tryCatch({
+      accepted_species <- name_usage(key = result$acceptedUsageKey, data = "all")
+      accepted_species$data$scientificName %||% NA_character_
+    }, error = function(e) NA_character_)
+  } else {
+    accepted_name <- result$scientificName %||% NA_character_
+  }
+  
+  tibble(SPECIESNAME = name, 
+         accepted_name = accepted_name, 
+         match_status = match_status)
+}
+
+# Create list of unique species names from your species dataframe
+species_list <- species %>%
+  distinct(SPECIESNAME) %>%
+  pull(SPECIESNAME)
+
+# Query GBIF for each species name and resolve synonyms
+gbif_synonym_check <- map_dfr(species_list, check_species)
+
+# Join resolved names back into your species dataframe
+species_cleaned <- species %>%
+  left_join(gbif_synonym_check, by = "SPECIESNAME") %>%
+  mutate(
+    SPECIESNAME_CLEAN = accepted_name,
+    is_synonym = SPECIESNAME != accepted_name & !is.na(accepted_name)
+  )
+
+#removing synonyms
+species_deduplicated <- species_cleaned %>%
+  distinct(SITECODE, accepted_name, .keep_all = TRUE)
+
+#correcting 3 species which were adjusted wrongly
+species_deduplicated <- species_deduplicated %>%
+  mutate(
+    accepted_name = case_when(
+      is.na(accepted_name) & SPECIESNAME == "Chloris chloris" ~ "Chloris chloris (Linnaeus, 1758)",
+      is.na(accepted_name) & SPECIESNAME == "Liparis loeselii" ~ "Liparis loeselii (L.) Rich.",
+      is.na(accepted_name) & SPECIESNAME == "Coronella austriaca" ~ "Coronella austriaca Laurenti, 1768",
+      TRUE ~ accepted_name
+    )
+  )
+```
+#Code 2 - Splitting EU nature directives and marine/terrestrial
+```{r}
+library(sf)
+
+## for terrestrial area
+#Load shapefiles
+areas <- st_read("Natura2000_end2023_epsg3035.shp")  # site polygons (land + marine)
+land <- st_read("BiogeoRegions2016.shp")             # land mask polygons
+
+#Transform to same CRS
+areas <- st_transform(areas, crs = st_crs(land))
+land <- st_make_valid(land)  # Clean geometries just in case
+areas <- st_make_valid(areas)
+
+#Compute total area per site (in ha)
+areas$area_total <- as.numeric(st_area(areas)) / 1e4  # convert m² to ha
+
+#Intersection (keep only SITECODE + geometry to avoid duplicates)
+intersected <- st_intersection(areas, land) %>%
+  select(SITECODE, geometry)
+
+#Calculate land area (in ha)
+intersected$area_land <- as.numeric(st_area(intersected)) / 1e4  # ha
+
+#Summarize land area per SITECODE
+land_area_sum <- intersected %>%
+  group_by(SITECODE) %>%
+  summarise(area_land = sum(area_land)) %>%
+  ungroup()
+
+#Join back land area to full dataset
+areas <- areas %>%
+  st_join(land_area_sum, by = "SITECODE")
+
+# Replace NAs with 0 = purely marine
+areas$area_land[is.na(areas$area_land)] <- 0
+
+#Compute land ratio (fraction of site on land)
+areas$land_ratio <- areas$area_land / areas$area_total
+
+#Classify as land/marine based on ≥10% rule for mostly land
+areas$classification <- ifelse(areas$land_ratio >= 0.10, "land", "marine")
+
+#areas filtreren
+#Keep only rows where SITECODE.x == SITECODE.y OR where SITECODE.y is NA
+areas <- areas %>%
+  filter(
+    is.na(SITECODE.y) | SITECODE.x == SITECODE.y
+  ) %>%
+#Drop one of the columns and rename back
+  mutate(SITECODE = coalesce(SITECODE.x, SITECODE.y)) %>%
+  select(-SITECODE.x, -SITECODE.y)
+
+area_totals <- areas %>%
+  group_by(classification) %>%
+  summarise(total_area_ha = sum(area_total))
+print(area_totals)
+
+##for marine areas
+
+#Load shapefiles
+areas2 <- st_read("Natura2000_end2023_epsg3035.shp")  # site polygons (land + marine)
+marine <- st_read("MSFD_Regions_and_Subregions_LAEA_20221003.shp")             # marine mask polygons
+
+#Transform to same CRS
+areas2 <- st_transform(areas2, crs = st_crs(marine))
+marine <- st_make_valid(marine)  # Clean geometries just in case
+area2s <- st_make_valid(areas2)
+
+#Compute total area per site (in ha)
+areas2$area_total <- as.numeric(st_area(areas2)) / 1e4  # convert m² to ha
+
+#Intersection (keep only SITECODE + geometry to avoid duplicates)
+intersected2 <- st_intersection(areas2, marine) %>%
+  select(SITECODE, geometry)
+
+#Calculate land area (in ha)
+intersected2$area_marine <- as.numeric(st_area(intersected2)) / 1e4  # ha
+
+#Summarize land area per SITECODE
+marine_area_sum <- intersected2 %>%
+  group_by(SITECODE) %>%
+  summarise(area_marine = sum(area_marine)) %>%
+  ungroup()
+
+#Join back land area to full dataset
+areas2 <- areas2 %>%
+  st_join(marine_area_sum, by = "SITECODE")
+
+# Replace NAs with 0 = purely land
+areas2$area_marine[is.na(areas2$area_marine)] <- 0
+
+#Compute land ratio (fraction of site on land)
+areas2$marine_ratio <- areas2$area_marine / areas2$area_total
+
+#Classify as land/marine based on ≥10% rule for mostly land
+areas2$classification <- ifelse(areas2$marine_ratio >= 0.10, "marine", "land")
+
+#filtering areas
+#Keep only rows where SITECODE.x == SITECODE.y OR where SITECODE.y is NA
+areas2 <- areas2 %>%
+  filter(
+    is.na(SITECODE.y) | SITECODE.x == SITECODE.y
+  ) %>%
+#Drop one of the columns and rename back
+  mutate(SITECODE = coalesce(SITECODE.x, SITECODE.y)) %>%
+  select(-SITECODE.x, -SITECODE.y)
+
+# Count the number of sites per SITETYPE and classification
+counts1 <- as.data.frame(table(areas$SITETYPE, areas$classification))
+
+# Rename columns for clarity
+colnames(counts1) <- c("SITETYPE", "classification", "count")
+
+# Count the number of sites per SITETYPE and classification
+counts2 <- as.data.frame(table(areas2$SITETYPE, areas2$classification))
+
+# Rename columns for clarity
+colnames(counts2) <- c("SITETYPE", "classification", "count")
+
+#calculating
+area_totals2 <- areas2 %>%
+  group_by(classification) %>%
+  summarise(total_area_ha = sum(area_total))
+
+print(area_totals2)
+
+#calculating areas per directive
+
+sitetype_summary2 <- areas %>%
+  group_by(SITETYPE) %>%
+  summarise(
+    n_sites = n(),
+    total_area_ha = sum(area_land)
+  ) %>%
+  ungroup()
+
+print(sitetype_summary2)
+
+sitetype_summary3 <- areas2 %>%
+  group_by(SITETYPE) %>%
+  summarise(
+    n_sites = n(),
+    total_area_ha = sum(area_marine)
+  ) %>%
+  ungroup()
+
+print(sitetype_summary3)
+
+# Create data frame with calculated data from code before
+natura_data <- data.frame(
+  Environment = rep(c("Total", "Terrestrial", "Marine", "Coastal"), each = 4),
+  Directive = rep(c("Habitats", "Birds", "Both", "Total"), times = 4),
+  Sites = c(21733, 3394, 2038, 27165,
+            20987, 3147, 1954, 26088,
+            1696, 583, 297, 2576,
+            2250, 727, 385, 3362),
+  Surface = c(81553290, 65658146, 19343247, 166554683,
+              44921360, 38571051, 14589932, 97748380,
+              36878356, 27384145, 4744432, 69006929,
+              NA, NA, NA, NA),
+  AvgSurface = c(3752, 19345, 9491, 6131,
+                 2140, 12256, 7466, 3747,
+                 21744, 46971, 15975, 26788,
+                 NA, NA, NA, NA)
+)
+
+# Filter out rows where Directive is "Total"
+natura_data_clean <- filter(natura_data, Directive != "Total")
+# Remove rows where Environment is "Total"
+natura_data_clean <- filter(natura_data, Environment != "Total")
+
+# Create custom fill variable
+natura_data_clean <- natura_data_clean %>%
+  filter(Directive != "Total") %>%
+  mutate(
+    Directive_env_fill = case_when(
+      Environment == "Coastal" & Directive == "Birds" ~ "Birds_grey",
+      Environment == "Coastal" & Directive == "Habitats" ~ "Habitats_grey",
+      Environment == "Coastal" & Directive == "Both" ~ "Both_grey",
+      TRUE ~ Directive
+    )
+  )
+
+# Create named vector for color values
+fill_colors <- c(
+  "Birds" = "#1f78b4",
+  "Habitats" = "#33a02c",
+  "Both" = "#6a3d9a",
+  "Birds_grey" = "grey60",
+  "Habitats_grey" = "grey80",
+  "Both_grey" = "grey40"
+)
+
+# Map all grey variants to the same labels in legend
+fill_labels <- c(
+  "Birds" = "Birds",
+  "Habitats" = "Habitats",
+  "Both" = "Both"
+)
+
+# Plot
+ggplot(natura_data_clean, aes(x = Environment, y = Sites, fill = Directive_env_fill)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(
+    values = fill_colors,
+    labels = fill_labels,
+    breaks = c("Birds", "Habitats", "Both"),  # only show the 3 main ones
+    name = "Directive"
+  ) +
+  labs(
+    title = "Number of Natura 2000 Sites by Directive and Environment",
+    x = "Environment", y = "Number of Sites"
+  ) +
+  theme_minimal()
+
+
+
+# Same color mapping as before (only colorful versions)
+fill_colors <- c(
+  "Birds" = "#1f78b4",
+  "Habitats" = "#33a02c",
+  "Both" = "#6a3d9a"
+)
+
+ggplot(
+  filter(natura_data_clean, !is.na(Surface) & Directive != "Total"),
+  aes(x = Environment, y = Surface / 1e6, fill = Directive)
+) +
+  geom_col(position = "stack") +
+  scale_fill_manual(
+    values = fill_colors,
+    name = "Directive"
+  ) +
+  labs(
+    title = "Total Surface Area (in million ha) by Directive and Environment",
+    x = "Environment", y = "Surface Area (in million ha)"
+  ) +
+  theme_minimal()
+
+```
+
+#Code 3 - Bioregion division
+```{r}
+# Load libraries
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# Load shapefiles
+natura <- st_read("Natura2000_end2023_epsg3035.shp")
+land_bio <- st_read("BiogeoRegions2016.shp")
+marine_bio <- st_read("MSFD_Regions_and_Subregions_LAEA_20221003.shp")
+
+# Fix invalid geometries
+natura <- st_make_valid(natura)
+land_bio <- st_make_valid(land_bio)
+marine_bio <- st_make_valid(marine_bio)
+
+# Ensure all layers use the same CRS (EPSG:3035)
+natura <- st_transform(natura, 3035)
+land_bio <- st_transform(land_bio, 3035)
+marine_bio <- st_transform(marine_bio, 3035)
+
+# Add surface area column in hectares
+natura$area_ha <- st_area(natura) %>% as.numeric() / 10000
+
+# Add a column to distinguish land vs marine
+land_bio$type <- "Terrestrial"
+marine_bio$type <- "marine"
+
+# Harmonize column names for bioregions
+land_bio <- land_bio %>% rename(bioregion = pre_2012)
+marine_bio <- marine_bio %>% rename(bioregion = region)
+
+# Combine all bioregions into one layer
+bioregions <- bind_rows(land_bio, marine_bio)
+
+# Intersect sites with bioregions
+natura_bioregion <- st_intersection(natura, bioregions)
+
+# Calculate new surface area after intersection (in ha)
+natura_bioregion$intersect_area_ha <- st_area(natura_bioregion) %>% as.numeric() / 10000
+
+# Summarize: sites and area per bioregion
+summary_total <- natura_bioregion %>%
+  group_by(bioregion, type) %>%
+  summarise(
+    total_sites = n_distinct(SITECODE),
+    total_area_ha = sum(intersect_area_ha, na.rm = TRUE)
+  ) %>%
+  arrange(type, bioregion)
+
+# Summarize by SITETYPE
+summary_by_sitetype <- natura_bioregion %>%
+  group_by(bioregion, type, SITETYPE) %>%
+  summarise(
+    sites = n_distinct(SITECODE),
+    area_ha = sum(intersect_area_ha, na.rm = TRUE)
+  ) %>%
+  arrange(type, bioregion, SITETYPE)
+
+# OPTIONAL: number of bioregions per type
+n_bioregions <- bioregions %>%
+  st_drop_geometry() %>%
+  group_by(type) %>%
+  summarise(n_bioregions = n_distinct(bioregion))
+
+summary_filtered <- summary_by_sitetype %>%
+  filter(bioregion != "OUT") %>%
+  mutate(type = ifelse(type == "marine", "Marine", type))
+
+print(summary_filtered)
+
+# Separate terrestrial and marine
+plot_sites_terrestrial <- summary_filtered %>%
+  filter(type == "Terrestrial", bioregion != "OUT")
+
+plot_sites_marine <- summary_filtered %>%
+  filter(type == "Marine", bioregion != "OUT")
+
+plot_area_terrestrial <- summary_filtered %>%
+  filter(type == "Terrestrial", bioregion != "OUT")
+
+plot_area_marine <- summary_filtered %>%
+  filter(type == "Marine", bioregion != "OUT")
+
+directive_colors <- c("A" = "#1f77b4", "B" = "#2ca02c", "C" = "#ff7f0e")
+directive_labels <- c("A" = "Birds Directive", "B" = "Habitats Directive", "C" = "Both Directives")
+
+# Plot 1: Sites - Marine
+p_sites_marine <- ggplot(plot_sites_marine, aes(x = bioregion, y = sites, fill = SITETYPE)) +
+  geom_col(width = 0.9) +
+  scale_x_discrete(expand = c(0, 3)) +
+  scale_y_continuous(limits = c(0, 10500), breaks = seq(0, 10500, by = 1000)) +  # <-- Same scale
+  labs(x = "Marine", y = "Number of Sites", fill = "Directives") +
+  scale_fill_manual(values = directive_colors, labels = directive_labels) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 2: Sites - Terrestrial
+p_sites_terrestrial <- ggplot(plot_sites_terrestrial, aes(x = bioregion, y = sites, fill = SITETYPE)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 11000), breaks = seq(0, 11000, by = 1000)) +  # <-- Same scale
+  labs(x = "Terrestrial", y = "Number of Sites", fill = "Directives") +
+  scale_fill_manual(values = directive_colors, labels = directive_labels) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine site plots
+p_sites_marine + p_sites_terrestrial + plot_layout(guides = "collect")
+
+# Plot 3: Area - Marine
+p_area_marine <- ggplot(plot_area_marine, aes(x = bioregion, y = area_ha, fill = SITETYPE)) +
+  geom_col(width = 0.9) +
+  scale_x_discrete(expand = c(0, 3)) +
+  scale_y_continuous(limits = c(0, 4.5e7), breaks = seq(0, 4.5e7, by = 1e7)) +  # <-- Same scale
+  labs(x = "Marine", y = "Surface Area (ha)", fill = "Directives") +
+  scale_fill_manual(values = directive_colors, labels = directive_labels) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 4: Area - Terrestrial
+p_area_terrestrial <- ggplot(plot_area_terrestrial, aes(x = bioregion, y = area_ha, fill = SITETYPE)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 4.5e7), breaks = seq(0, 4.5e7, by = 1e7)) +  # <-- Same scale
+  labs(x = "Terrestrial", y = "Surface Area (ha)", fill = "Directives") +
+  scale_fill_manual(values = directive_colors, labels = directive_labels) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine area plots
+p_area_marine + p_area_terrestrial + plot_layout(guides = "collect")
+
+```
+
+#Code 4 - Species counts per sites divided by birds and non birds
+```{r}
+# 1. Split into birds and non-birds
+birds <- species_deduplicated %>% filter(SPGROUP == "Birds")
+non_birds <- species_deduplicated %>% filter(SPGROUP != "Birds")
+
+# 2. Count DISTINCT accepted_name per SITECODE
+bird_counts <- birds %>%
+  group_by(SITECODE) %>%
+  summarise(Bird_species_count = n_distinct(accepted_name), .groups = "drop")
+
+non_bird_counts <- non_birds %>%
+  group_by(SITECODE) %>%
+  summarise(Non_bird_species_count = n_distinct(accepted_name), .groups = "drop")
+
+# 3. Rename the columns for clarity
+colnames(bird_counts) <- c("SITECODE", "Bird_species_count")
+colnames(non_bird_counts) <- c("SITECODE", "Non_bird_species_count")
+```
+
+
+#Code 5 - Protected Natura 2000 species analysis
+```{r}
+library(ggplot2)
+library(patchwork)
+directives2 <-read.csv("Nature_Directives_species_annexes_2021_20220125 (3).csv")
+
+#Deduplicate species_deduplicated to one row per species
+species_dedup_unique <- species_deduplicated %>%
+  select(SPECIESNAME, accepted_name) %>%
+  distinct(SPECIESNAME, .keep_all = TRUE)
+
+#Join it with directives2
+directives3 <- directives2 %>%
+  left_join(species_dedup_unique, 
+            by = c("species_name" = "SPECIESNAME"))
+
+# First, link species to site and bioregion info
+species_bioregion <- species_deduplicated %>%
+  filter(!is.na(accepted_name)) %>%
+  select(SITECODE, accepted_name) %>%
+  distinct() %>%
+  left_join(natura_bioregion, by = "SITECODE") %>%
+  filter(!is.na(type))  # land/marine
+
+species_annexes_bioregion <- species_bioregion %>%
+  left_join(directives3, by = "accepted_name")
+
+# Pick the annex columns you want to analyze
+annex_cols <- c("HD_annexII", "HD_annexIV", "HD_annexV",
+                "BD_annexI", "BD_annexII_partA", "BD_annexII_partB",
+                "BD_annexIII_partA", "BD_annexIII_partB")
+
+# Pivot annex info to long format
+annex_long <- species_bioregion %>%
+  left_join(directives3, by = "accepted_name") %>%
+  select(accepted_name, bioregion, type, all_of(annex_cols)) %>%
+  pivot_longer(cols = all_of(annex_cols),
+               names_to = "annex",
+               values_to = "included") %>%
+  filter(included == "Y") %>%
+  distinct(accepted_name, bioregion, type, annex)
+
+# Filter and prepare data for land
+plot_land <- annex_long %>%
+  filter(type == "Terrestrial", bioregion != "OUT") %>%
+  count(bioregion, annex) %>%
+  mutate(
+    annex = recode(annex,
+                   "HD_annexII" = "HD II",
+                   "HD_annexIV" = "HD IV",
+                   "HD_annexV" = "HD V",
+                   "BD_annexI" = "BD I",
+                   "BD_annexII_partA" = "BD II-A",
+                   "BD_annexII_partB" = "BD II-B",
+                   "BD_annexIII_partA" = "BD III-A",
+                   "BD_annexIII_partB" = "BD III-B")
+  )
+
+# Plot for land
+p1 <- ggplot(plot_land, aes(x = bioregion, y = n, fill = annex)) +
+  geom_col(width = 0.9) +
+  scale_y_continuous(limits = c(0, 1100), breaks = seq(0, 1100, by = 100)) +  # <-- Same scale
+  labs(x = "Terrestrial", y = "Number of species",
+       title = "",
+       fill = "Annex") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Filter and prepare data for marine
+plot_marine <- annex_long %>%
+  filter(type == "marine") %>%
+  count(bioregion, annex) %>%
+  mutate(
+    annex = recode(annex,
+                   "HD_annexII" = "HD II",
+                   "HD_annexIV" = "HD IV",
+                   "HD_annexV" = "HD V",
+                   "BD_annexI" = "BD I",
+                   "BD_annexII_partA" = "BD II-A",
+                   "BD_annexII_partB" = "BD II-B",
+                   "BD_annexIII_partA" = "BD III-A",
+                   "BD_annexIII_partB" = "BD III-B")
+  )
+
+# Plot for marine
+p2 <- ggplot(plot_marine, aes(x = bioregion, y = n, fill = annex)) +
+  geom_col(width = 0.9) +
+  scale_x_discrete(expand = c(0, 3)) +
+  scale_y_continuous(limits = c(0, 1100), breaks = seq(0, 1100, by = 100)) +  # <-- Same scale
+  labs(x = "Marine", y = "Number of species",
+       title = "",
+       fill = "Annex") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 + p1 + plot_layout(guides = "collect")
+
+#counts of bioregion and taxonimic group
+
+# Join SPGROUP
+annex_with_group <- annex_long %>%
+  left_join(species_deduplicated %>% select(accepted_name, SPGROUP), by = "accepted_name") %>%
+  filter(!is.na(SPGROUP), bioregion != "OUT")  # remove OUT and missing groups
+
+plot_taxgroup <- annex_with_group %>%
+  filter(!is.na(accepted_name)) %>%
+  distinct(bioregion, type, SPGROUP, accepted_name) %>%  # Count unique species
+  group_by(bioregion, type, SPGROUP) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n > 0) %>%
+  mutate(across(c(bioregion, type, SPGROUP), ~ droplevels(factor(.))))
+
+
+# Exclude birds
+taxgroups_no_birds <- plot_taxgroup %>% 
+  filter(SPGROUP != "Birds") %>% 
+  filter(SPGROUP != "")
+
+# LAND (no birds)
+p_land <- taxgroups_no_birds %>%
+  filter(type == "Terrestrial") %>%
+  ggplot(aes(x = bioregion, y = n, fill = SPGROUP)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 450), breaks = seq(0, 450, by = 100)) +  
+  labs(title = "",
+       x = "Terrestrial", y = "Number of Species", fill = "Taxonomic Group") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# MARINE (no birds)
+p_marine <- taxgroups_no_birds %>%
+  filter(type == "marine") %>%
+  ggplot(aes(x = bioregion, y = n, fill = SPGROUP)) +
+  geom_col(width = 0.9) +
+  scale_x_discrete(expand = c(0, 3)) +
+  scale_y_continuous(limits = c(0, 450), breaks = seq(0, 450, by = 100)) + 
+  labs(title = "",
+       x = "Marine", y = "Number of Species", fill = "Taxonomic Group") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine
+p_marine + p_land
+
+# Only birds
+taxgroup_birds <- plot_taxgroup %>% filter(SPGROUP == "Birds")
+
+# LAND (birds only)
+p_land_birds <- taxgroup_birds %>%
+  filter(type == "Terrestrial") %>%
+  ggplot(aes(x = bioregion, y = n)) +
+  geom_col(fill = "#1f77b4") +
+  scale_y_continuous(limits = c(0, 250), breaks = seq(0, 250, by = 50)) + 
+  labs(title = "",
+       x = "Terrestrial", y = "Number of Species") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# MARINE (birds only)
+p_marine_birds <- taxgroup_birds %>%
+  filter(type == "marine") %>%
+  ggplot(aes(x = bioregion, y = n)) +
+  geom_col(width = 0.9, fill = "#1f77b4") +
+  scale_x_discrete(expand = c(0, 3)) +
+  scale_y_continuous(limits = c(0, 250), breaks = seq(0, 250, by = 50)) + 
+  labs(title = "",
+       x = "Marine", y = "Number of Species") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine
+p_marine_birds + p_land_birds + plot_layout(guides = "collect")
+
+#species divided taxonomic groups in directives
+
+# Join SPGROUP and count
+directive_group_counts <- annex_long %>%
+  left_join(species_deduplicated %>% select(accepted_name, SPGROUP), by = "accepted_name") %>%
+  filter(!is.na(SPGROUP)) %>%
+  count(SPGROUP, annex)
+
+
+# Calculate percentage within each SPGROUP
+directive_group_percent <- directive_group_counts %>%
+  group_by(SPGROUP) %>%
+  mutate(percent = n / sum(n) * 100) %>%
+  filter(SPGROUP != "") %>% 
+  mutate(
+    annex = recode(annex,
+                   "HD_annexII" = "HD II",
+                   "HD_annexIV" = "HD IV",
+                   "HD_annexV" = "HD V",
+                   "BD_annexI" = "BD I",
+                   "BD_annexII_partA" = "BD II-A",
+                   "BD_annexII_partB" = "BD II-B",
+                   "BD_annexIII_partA" = "BD III-A",
+                   "BD_annexIII_partB" = "BD III-B")
+  )
+
+directive_group_percent <- directive_group_percent %>%
+  mutate(SPGROUP = factor(SPGROUP, levels = c(
+    "Amphibians", "Fish", "Invertebrates", "Mammals", "Plants", "Reptiles", "Birds"
+  )))
+
+
+ggplot(directive_group_percent, aes(x = SPGROUP, y = percent, fill = annex)) +
+  geom_col() +
+  labs(
+    title = "Directive Annex Composition per Taxonomic Group",
+    x = "Taxonomic Group", y = "Percentage of Species",
+    fill = "Directive Annex"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+#Code 6 - GBIF data analysis
+```{r}
+# Your unique species list
+species_list <- unique(species_deduplicated$accepted_name)
+
+# EU country codes
+eu_countries <- c("AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE",
+                  "GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT",
+                  "RO","SK","SI","ES","SE")
+
+# Progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :current/:total (:percent) - :species",
+  total = length(species_list), clear = FALSE, width = 60
+)
+
+# Function to count total occurrences in all EU countries
+get_gbif_count_eu <- function(species_name) {
+  total <- 0
+  pb$tick(tokens = list(species = species_name))
+  
+  for (cc in eu_countries) {
+    res <- tryCatch({
+      out <- occ_search(scientificName = species_name, 
+                        country = cc, 
+                        hasCoordinate = TRUE,
+                        limit = 0)$meta$count
+      if (is.null(out)) 0 else as.integer(out)
+    }, error = function(e) 0)
+    
+    total <- total + res
+  }
+  
+  return(total)
+}
+
+# Run the count function
+results <- tibble(accepted_name = species_list) %>%
+  mutate(gbif_occurrences_eu = map_int(accepted_name, get_gbif_count_eu))
+
+# View / save results
+head(results)
+# write.csv(results, "species_gbif_counts.csv", row.names = FALSE)
+
+#Deduplicate species_deduplicated to get one SPGROUP per species
+species_groups <- species_deduplicated %>%
+  select(accepted_name, SPGROUP) %>%
+  mutate(SPGROUP = if_else(accepted_name == "Leucos basak Heckel, 1843", "Fish", SPGROUP)) %>%
+  distinct(accepted_name, .keep_all = TRUE)  # Keep only one row per species
+
+#Join group info to results (which already has one row per species)
+results %>%
+  left_join(species_groups, by = "accepted_name") %>%
+  group_by(SPGROUP) %>%
+  summarise(
+    species_count = n(),  # One row = one unique species
+    total_gbif_points = sum(gbif_occurrences_eu, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_gbif_points))
+
+#Collapse bioregion and type to one row per species
+species_with_region <- species_deduplicated %>%
+  left_join(natura_bioregion, by = "SITECODE") %>%
+  filter(!is.na(bioregion), bioregion != "OUT") %>%
+  select(accepted_name, SPGROUP, bioregion, type) %>%
+  mutate(SPGROUP = if_else(accepted_name == "Leucos basak Heckel, 1843", "Fish", SPGROUP)) %>%
+  distinct(accepted_name, bioregion, type, .keep_all = TRUE)
+
+#Join to results (1 row per species, with correct GBIF data)
+results_with_region <- results %>%
+  left_join(species_with_region, by = "accepted_name") %>%
+  filter(!is.na(SPGROUP), !is.na(bioregion))
+
+#Summarise per SPGROUP/bioregion/type
+results_with_region %>%
+  group_by(SPGROUP, bioregion, type) %>%
+  summarise(
+    species_count = n_distinct(accepted_name),
+    total_gbif_points = sum(gbif_occurrences_eu, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_gbif_points))
+
+results_with_region %>%
+  filter(type == "marine") %>%
+  ggplot(aes(x = SPGROUP, y = gbif_occurrences_eu, fill = bioregion)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  scale_y_log10(
+    breaks = c(10, 100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)
+  ) +
+  labs(
+    title = "GBIF Occurrence Points Distribution per Species (Marine Bioregions)",
+    x = "Taxonomic Group", y = "GBIF Points (log10)", fill = "Bioregion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+results_with_region %>%
+  filter(type == "Terrestrial") %>%
+  ggplot(aes(x = SPGROUP, y = gbif_occurrences_eu, fill = bioregion)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  scale_y_log10(
+    breaks = c(10, 100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)
+  ) +
+  labs(
+    title = "GBIF Occurrence Points Distribution per Species (Terrestrial Bioregions)",
+    x = "Taxonomic Group", y = "GBIF Points (log10)", fill = "Bioregion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
